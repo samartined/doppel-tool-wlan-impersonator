@@ -1,4 +1,4 @@
-# wlan-impersonator
+# `doppel`
 
 Terminal tool to impersonate a WiFi client's identity on the local network. Clones the MAC address, injects a custom hostname via DHCP option 12, and holds the router's ARP table with continuous gratuitous ARPs.
 
