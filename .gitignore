@@ -1,0 +1,74 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+
+# Virtual environment
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+.pdm-python
+
+# VS Code settings
+.vscode/
+
+# PyCharm settings
+.idea/
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Mac / Linux / Windows system files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Ignore secrets and credentials
+*.pem
+*.key
+
+# Ignore wlan-impersonator runtime/artifacts
+capture.pcap
+capture*.pcap
+*.cap
+output/
+logs/
+tmp/
+cache/

