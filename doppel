@@ -447,7 +447,8 @@ def _print_dry_run(args: argparse.Namespace) -> None:
     step = 1
     if args.router_bssid:
         mon = args.monitor_iface or args.iface
-        print(f"  {step}. Deauth {args.target_mac} via {mon} (monitor mode, AP {args.router_bssid})")
+        print(f"  {step}. Deauth {args.target_mac} via {mon} "
+              f"(monitor mode, AP {args.router_bssid})")
         step += 1
     print(f"  {step}. nmcli modify {args.connection}: "
           f"cloned-mac={args.target_mac}, dhcp-hostname={args.target_hostname}")
