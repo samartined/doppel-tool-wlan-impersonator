@@ -72,3 +72,17 @@ output/
 logs/
 tmp/
 cache/
+
+# ── doppel: runtime state (never commit target identifiers) ──
+.state
+.state.*.tmp
+state.json
+run-doppel/
+
+# ── doppel: local audit docs (kept out of version control by request) ──
+docs/
+
+# ── Python test / lint caches ──
+.pytest_cache/
+.ruff_cache/
+__pycache__/

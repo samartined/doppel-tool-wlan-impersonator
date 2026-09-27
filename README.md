@@ -1,18 +1,28 @@
 # `doppel`
 
-Terminal tool to impersonate a WiFi client's identity on the local network. Clones the MAC address, injects a custom hostname via DHCP option 12, and holds the router's ARP table with continuous gratuitous ARPs.
+Terminal tool to **impersonate a WiFi client's identity** on the local network. It clones the
+target's MAC address, injects a custom hostname via DHCP option 12, and holds the router's ARP table
+with continuous gratuitous ARPs. Optionally it deauthenticates the real device first so there is no
+MAC conflict.
+
+> This is a **client-side identity takeover** tool (it runs as a normal managed-mode station via
+> NetworkManager). It is **not** an evil-twin / rogue-AP: there is no `hostapd`, no DHCP/DNS server
+> and no captive portal. Use only on networks you are authorised to test.
 
 ## Dependencies
 
-- Python 3.10+
-- `nmcli` (NetworkManager)
-- `arping` (iputils-arping)
-- `aireplay-ng` (aircrack-ng) — only needed when using `-b/--router-bssid` for deauth
+- Python 3.10+ (standard library only)
+- `nmcli` (NetworkManager) — always
+- `arping` — always. Both **Thomas Habets `arping`** and **iputils-arping** are supported; the tool
+  detects which one is installed and builds the correct command for it.
+- `aireplay-ng` (aircrack-ng), `iw`, `ip` — only when using `-b/--router-bssid` (deauth)
 
 ## Quick start
 
 ```
 sudo ./doppel <start|stop|status> [OPTIONS]
+sudo ./doppel start ... --dry-run     # print the plan without changing anything
+./doppel --version
 ```
 
 ## Subcommands
@@ -20,44 +30,46 @@ sudo ./doppel <start|stop|status> [OPTIONS]
 ### `start` — Activate impersonation
 
 Applies the spoofed identity, reconnects the WiFi connection, and holds the router's ARP table.
-
-**Full flow** (deauth + spoof + arping):
-
-```bash
-sudo ./doppel start \
-  -c "MyWiFi" \
-  -i wlo1 \
-  -m aa:bb:cc:dd:ee:ff \
-  -n "TARGET-PC" \
-  -a 192.168.1.42 \
-  -b 00:11:22:33:44:55
-```
+If anything fails mid-way, `doppel` **automatically rolls back** (reverts the connection and clears
+state) instead of leaving a half-spoofed profile behind.
 
 **Spoof only** (no deauth, omit `-b`):
 
 ```bash
 sudo ./doppel start \
   -c "MyWiFi" \
-  -i wlo1 \
-  -m aa:bb:cc:dd:ee:ff \
+  -i wlan0 \
+  -m aa:bb:cc:dd:ee:f0 \
   -n "TARGET-PC" \
   -a 192.168.1.42
+```
+
+**Full flow** (deauth + spoof + arping):
+
+```bash
+sudo ./doppel start \
+  -c "MyWiFi" -i wlan0 \
+  -m aa:bb:cc:dd:ee:f0 -n "TARGET-PC" -a 192.168.1.42 \
+  -b 00:11:22:33:44:55
 ```
 
 | Short | Long | Description |
 |---|---|---|
 | `-c` | `--connection` | NetworkManager connection name (required) |
-| `-i` | `--iface` | Wireless interface, e.g. `wlo1` (required) |
-| `-m` | `--target-mac` | MAC address to impersonate (required) |
-| `-n` | `--target-hostname` | Hostname to inject via DHCP option 12 (required) |
-| `-a` | `--target-ip` | IP address for gratuitous ARP (required) |
-| `-b` | `--router-bssid` | AP BSSID — enables initial deauth burst (optional) |
-| | `--deauth-count` | Number of deauth frames (default: 10) |
-| | `--deauth-delay` | Seconds to wait after deauth (default: 3) |
+| `-i` | `--iface` | Wireless interface, e.g. `wlan0` (required) |
+| `-m` | `--target-mac` | **Unicast** MAC address to impersonate (required) |
+| `-n` | `--target-hostname` | Hostname to inject via DHCP option 12 (required, DNS-valid) |
+| `-a` | `--target-ip` | **IPv4** address for gratuitous ARP (required) |
+| `-b` | `--router-bssid` | AP BSSID — enables an initial deauth burst (optional) |
+| | `--monitor-iface` | Separate monitor-capable adapter for the deauth (optional) |
+| | `--deauth-count` | Deauth **bursts** (1–1000, default 10). Each burst ≈ 128 frames |
+| | `--deauth-delay` | Seconds to wait after deauth (0–60, default 3) |
+| | `--dry-run` | Show the planned actions and exit without executing |
 
 ### `stop` — Revert impersonation
 
-Stops the `arping` process, clears the cloned MAC and DHCP hostname, and reconnects with the original identity.
+Stops the `arping` process (verifying the PID is really `arping` before killing it), clears the cloned
+MAC and DHCP hostname, and reconnects with the original identity.
 
 ```bash
 sudo ./doppel stop -c "MyWiFi"
@@ -65,94 +77,87 @@ sudo ./doppel stop -c "MyWiFi"
 
 ### `status` — Show current state
 
-Displays the spoofing values configured on the connection and the `arping` process state.
+Displays the spoofing values configured on the connection and the tracked `arping` process state.
+Run it with `sudo` if `start` was run with `sudo` (runtime state lives in root-owned `/run/doppel`).
 
 ```bash
-./doppel status -c "MyWiFi"
+sudo ./doppel status -c "MyWiFi"
 ```
+
+## Deauth: monitor mode
+
+`aireplay-ng` needs the adapter in **monitor mode** on the AP's channel. `doppel` handles this for you:
+
+- **Single card** (default): the given `--iface` is briefly switched to monitor mode (released from
+  NetworkManager, channel set from the AP's BSSID), the deauth is sent, and the card is restored to
+  managed mode before connecting. There is a short window where the card is not associated.
+- **Two cards** (`--monitor-iface`): the deauth runs on the dedicated monitor adapter while `--iface`
+  stays managed. Preferred when you have a second adapter.
+
+If injection cannot be verified (adapter without monitor/injection support, wrong channel, etc.), the
+deauth **fails loudly and rolls back** — it no longer silently pretends to have kicked the target.
 
 ## When to use each flag
 
-### Required flags (always needed)
+**`-b` / `--router-bssid`** depends on whether the target is connected *right now*:
 
-| Flag | Why |
-|---|---|
-| `-c` | The script needs to know which NetworkManager WiFi connection to manipulate. This is the name shown by `nmcli connection show`, e.g. `"MyWiFi"`. |
-| `-i` | The physical wireless interface you are connected through (`wlo1`, `wlan0`...). Needed to launch `arping` on that interface. |
-| `-m` | The MAC address of the device you want to impersonate. Without this there is no spoofing. |
-| `-n` | The hostname the router will show in its client table. This is what gets injected into DHCP option 12. |
-| `-a` | The target device's IP address. Used for gratuitous ARPs that keep the router's ARP table pointing at you. |
+- **Target IS connected**: use `-b`. It deauthenticates the target before you take its identity,
+  avoiding a MAC conflict.
+- **Target is NOT connected** (off / out of range): you don't need `-b`.
 
-### Optional flags (depends on the scenario)
+**`--deauth-count`** / **`--deauth-delay`** only matter with `-b`. Note `--deauth-count` counts
+*bursts* (each burst sends 64 frames to the client and 64 to the AP), not individual frames.
 
-**`-b` / `--router-bssid`** — Whether to use it depends on whether the target device is connected at the same time:
+## Notes on `--target-ip`
 
-- **IF the target IS connected to the network**: you need `-b`. The script will send deauth frames to disconnect it before you connect with its identity. Without this, both devices would compete for the same MAC and connectivity would be unstable for both.
-- **IF the target is NOT connected** (powered off, out of range, etc.): you don't need `-b`. There is no MAC conflict, so you can connect directly with the spoofed identity without a prior deauth.
-
-**`--deauth-count`** and **`--deauth-delay`** — Only relevant when using `-b`:
-
-- `--deauth-count` (default: 10): how many deauth frames to send. If the target doesn't disconnect with 10, increase the number. If you want to be more discreet, lower it.
-- `--deauth-delay` (default: 3): seconds to wait between the deauth and the connection. Allow more time if the network is slow to release the target's MAC from its table.
-
-### Examples by scenario
-
-**Target disconnected (simple case):**
-
-```bash
-sudo doppel start -c "MyWiFi" -i wlo1 -m aa:bb:cc:dd:ee:ff -n "TARGET-PC" -a 192.168.1.42
-```
-
-**Target connected (need to kick it off first):**
-
-```bash
-sudo doppel start -c "MyWiFi" -i wlo1 -m aa:bb:cc:dd:ee:ff -n "TARGET-PC" -a 192.168.1.42 -b 00:11:22:33:44:55
-```
-
-**Target connected and resistant (more aggressive):**
-
-```bash
-sudo doppel start -c "MyWiFi" -i wlo1 -m aa:bb:cc:dd:ee:ff -n "TARGET-PC" -a 192.168.1.42 -b 00:11:22:33:44:55 --deauth-count 50 --deauth-delay 5
-```
+The gratuitous ARP announces `--target-ip → your (cloned) MAC` to poison the router's ARP cache. Your
+station still gets its own address from DHCP; if that address differs from `--target-ip`, `doppel`
+warns you (the announce is only fully effective when DHCP hands you the target's lease).
 
 ## Global installation
-
-To use `doppel` from any directory without navigating to the script's folder:
 
 ### Option 1 — Symlink in `/usr/local/bin` (recommended)
 
 ```bash
-sudo ln -s /path/to/wlan-impersonator/doppel /usr/local/bin/doppel
-```
-
-After this, from any terminal:
-
-```bash
-sudo doppel start -c "MyWiFi" ...
+sudo ln -s "$(pwd)/doppel" /usr/local/bin/doppel
 ```
 
 The symlink points to the real script, so edits are reflected immediately.
 
-### Option 2 — Add the folder to PATH in `.zshrc`
+### Option 2 — Add the folder to PATH
 
-Add this line to `~/.zshrc`:
+Add to `~/.zshrc` (or `~/.bashrc`):
 
 ```bash
-export PATH="$HOME/Sync/wlan-impersonator:$PATH"
+export PATH="/path/to/doppel-tool-wlan-impersonator:$PATH"
 ```
 
-After reloading the shell (`source ~/.zshrc` or opening a new terminal), `doppel` will be available globally. The difference from option 1 is that this only applies to your user and to zsh, while the symlink in `/usr/local/bin` works for any user and any shell.
+Runtime state is stored in `/run/doppel/` (tmpfs, cleared on reboot), **not** in the tool directory,
+so a read-only install works fine and no target identifiers ever land next to the source.
 
 ## How it works
 
-1. **Deauth** (optional): sends deauthentication frames to the target device to disconnect it from the AP.
-2. **Spoofing**: sets `wifi.cloned-mac-address` and `ipv4.dhcp-hostname` on the NetworkManager connection.
-3. **Reconnection**: brings the connection down and back up so NetworkManager applies the fake MAC and negotiates DHCP with the injected hostname.
-4. **Gratuitous ARP**: launches `arping -U` in the background to permanently keep the router's ARP table pointing at this machine.
-5. **State**: saves the PID and metadata to `.state` so that `stop` and `status` work reliably.
+1. **Deauth** (optional): switches an adapter to monitor mode on the AP channel and sends deauth
+   bursts to the target, then restores managed mode.
+2. **Spoofing**: sets `wifi.cloned-mac-address` and `ipv4.dhcp-hostname` on the NM connection.
+3. **Reconnection**: brings the connection down/up so NM applies the fake MAC and negotiates DHCP with
+   the injected hostname.
+4. **Gratuitous ARP**: launches `arping -U` in the background (flavor-aware) to keep the router's ARP
+   table pointing at this machine. Startup is verified — a dead arping is reported, not hidden.
+5. **State**: saves the PID and metadata to `/run/doppel/state.json` (0600) so `stop`/`status` work.
+
+## Development
+
+```bash
+python3 -m pip install -r requirements-dev.txt
+python3 -m pytest -q            # unit tests for the pure logic
+ruff check doppel tests/        # lint
+python3 -m py_compile doppel    # syntax check
+```
 
 ## Warnings
 
-- If the target device is connected simultaneously, a MAC conflict occurs. Use `-b` to disconnect it first.
-- The continuous `arping -U` overwrites the router's ARP entry, but if the target reconnects there may be instability for both.
-- Always run `stop` before closing the session to revert the identity.
+- If the target device is connected simultaneously, a MAC conflict occurs. Use `-b` to disconnect it.
+- The deauth is a one-shot burst; a resistant target can re-associate. Raise `--deauth-count` or use a
+  dedicated monitor adapter for sustained pressure.
+- Always run `stop` to revert the identity when finished.
